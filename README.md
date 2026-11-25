@@ -20,9 +20,8 @@ The ProVerif model checks, for an unbounded number of sessions, whether a Dolevâ
 5. [ProVerif Model](#proverif-model)
 6. [Security Queries](#security-queries)
 7. [Results](#results)
-8. [Scope and Limitations](#scope-and-limitations)
-9. [Citation](#citation)
-10. [References](#references)
+8. [Citation](#citation)
+9. [References](#references)
 
 ---
 
@@ -272,19 +271,6 @@ Query inj-event(UserFinish(x,y)) ==> inj-event(DroneFinish(z,y)) is true.
 ```
 
 The complete output is available in `result/ProVerif`.
-
----
-
-## Scope and Limitations
-
-The results hold in the symbolic model under the following abstractions:
-
-- **Perfect cryptography.** The hash function and ML-KEM are idealised; computational bounds are addressed by the ROR-based proof in the paper, not by this model.
-- **XOR.** Only the cancellation law `xor(xor(x,y),y) = x` is modelled; the other algebraic properties of XOR are not.
-- **PUF.** The PUF is ideal and noise-free; fuzzy extractors and error correction are out of scope.
-- **Timestamps.** Time-difference checks are abstracted by public clock values, as described above.
-- **Password.** `attacker(PWi)` establishes that the password cannot be derived symbolically; offline guessing of low-entropy secrets is not modelled.
-- **Compromise.** The adversary obtains `{Ci, D1, D2}` from a stolen mobile device and `{Fj, Gj}` plus PUF-oracle access from a captured drone. `GSS`, `skGSS`, and the drone key `DKj` are assumed uncompromised.
 
 ---
 
