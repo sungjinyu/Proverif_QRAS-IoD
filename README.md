@@ -7,7 +7,7 @@ This repository contains the ProVerif model and the verification results used in
 > **Quantum-safe and Robust Authentication and Key Agreement Scheme for PUF-enabled Internet of Drones**
 > (Joonyoung Lee, Sungjin Yu, and Kisung Park)
 
-The ProVerif model checks, for an unbounded number of sessions, whether a Dolev–Yao adversary who fully controls the public channel — and who may additionally steal the user's mobile device or physically capture a drone — can break the secrecy of the identities, the password, and the session key, or the mutual authentication among the mobile user, the ground station server, and the drone.
+The ProVerif model checks, for an unbounded number of sessions, whether a Dolev–Yao adversary who fully controls the public channel and who may additionally steal the user's mobile device or physically capture a drone can break the secrecy of the identities, the password, and the session key, or the mutual authentication among the mobile user, the ground station server, and the drone.
 
 ---
 
