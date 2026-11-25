@@ -1,0 +1,446 @@
+(* =====================================================================
+   ProVerif model of QRAS-IoD
+   "Quantum-safe and Robust Authentication and Key Agreement Scheme for
+   PUF-enabled Internet of Drones"
+
+   Run with:  proverif QRAS-IoD.pv
+
+   Drone registration 
+     Dj  : picks rj, Cj;  Rj = PUF(Cj)
+     Dj -> GSS (secure) : {IDDj, rj, (Cj, Rj)}
+     GSS : PIDDj = h(IDDj || skGSS)
+           Gj    = PIDDj XOR h(IDDj || rj)
+           stores {PIDDj, (Cj, Rj)} indexed by IDDj
+     GSS -> Dj (secure) : {Gj}
+     Dj  : Fj = (rj || Cj) XOR h(IDDj || DKj);  stores {Fj, Gj}
+
+   User registration 
+     MUi : RPWi = h(PWi || IDi)
+     MUi -> GSS (secure) : {IDi, RPWi}
+     GSS : PIDi = h(IDi || skGSS || RPWi),  Xi = h(PIDi || skGSS)
+           Bi = Xi XOR RPWi,                Ci = h(IDi || RPWi || Xi)
+           stores {PIDi, Xi}
+     GSS -> MUi (secure) : {PIDi, IDDj, Bi, Ci}
+     MUi : D1 = Bi XOR h(IDi || PWi || RPWi)
+           D2 = (PIDi || IDDj) XOR h(RPWi || IDi);  stores {Ci, D1, D2}
+
+   AKA (Section 4.4)
+     Msg1 = {ct1, M1, M2, V1, TIDi, T1}
+       M1 = (PIDi || IDDj) XOR h(K1 || TIDi || T1)
+       M2 = N1 XOR h(K1 || Xi || T1)
+       V1 = h(PIDi || TIDi || Xi || K1 || N1 || T1)
+     Msg2 = {M3, V2, T2}
+       M3 = (PIDi || N1 || N2 || Cj) XOR h(IDDj || PIDDj || Rj || T2)
+       V2 = h(IDDj || N2 || Rj || T2)
+     Msg3 = {M4, V3, V4, T3}
+       M4 = N3 XOR h(Rj || PIDDj || T3)
+       SK = h(PIDi || IDDj || N1 || N2 || N3)
+       V3 = h(PIDDj || IDDj || Rj || N2 || N3)
+       V4 = h(IDDj || PIDi || SK)
+     Msg4 = {M5, V4, V5, T3, T4}
+       M5 = (N2 || N3) XOR h(N1 || K1 || PIDi || Xi)
+       V5 = h(N1 || N2 || K1 || PIDi || T4)
+
+
+   ===================================================================== *)
+
+(* ---------------------- Channels ---------------------- *)
+free pub: channel.              (* public channel, fully Dolev-Yao controlled *)
+free scDG: channel [private].   (* secure channel: Drone -> GSS (registration request) *)
+free scGD: channel [private].   (* secure channel: GSS -> Drone (registration reply)   *)
+free scGU: channel [private].   (* secure channel: User <-> GSS registration          *)
+(* The drone registration uses one private channel per direction. The
+   reply {Gj} is a single value, so on a shared channel a waiting drone
+   could mistake another drone's request {IDDj, rj, (Cj, Rj)} for "its
+   Gj" -- a pure modelling artefact that would hand request data to the
+   capture process below. Two directed channels rule this out. (The
+   user side needs no such split: its request is a pair and its reply
+   a 4-tuple, so they can never be confused.) *)
+
+(* ---------------------- Long-term identities / secrets ---------------------- *)
+free IDi: bitstring [private].
+free IDDj: bitstring [private].
+free PWi: bitstring [private].
+free DKj: bitstring [private].  (* unique secret key of Dj (Table 1); protected
+                                   against extraction, Section 5.1.5 assumption (ii) *)
+
+(* ---------------------- Hash function ---------------------- *)
+fun h(bitstring): bitstring.
+
+(* ---------------------- Concatenation (||) ---------------------- *)
+fun cat2(bitstring,bitstring): bitstring [data].
+
+(* ---------------------- XOR ---------------------- *)
+fun xor(bitstring,bitstring): bitstring.
+(* Only the cancellation law is declared. It alone is a terminating
+   rewrite rule (the left-hand side is strictly larger than the right),
+   so ProVerif accepts it. Commutativity is intentionally NOT declared:
+   ProVerif cannot orient x=y into a terminating rule, and -- checking
+   every use of xor(.) in this model -- it is never actually needed,
+   because each masked value is always reconstructed by XOR-ing with
+   the exact same second argument used to build it (never the swapped
+   order). *)
+equation forall x:bitstring, y:bitstring; xor(xor(x,y),y) = x.
+
+fun puf(bitstring): bitstring [private].
+
+fun pk(bitstring): bitstring.
+fun kemCt(bitstring, bitstring): bitstring.          (* pk, randomness -> ciphertext *)
+fun kemKey(bitstring, bitstring): bitstring [private]. (* pk, randomness -> shared secret *)
+reduc forall sk: bitstring, r: bitstring;
+      kemDecaps(sk, kemCt(pk(sk), r)) = kemKey(pk(sk), r).
+
+fun senc(bitstring,bitstring): bitstring.
+reduc forall m: bitstring, k: bitstring; sdec(senc(m,k),k) = m.
+free SK: bitstring [private].   (* marker used to test the real session key's secrecy *)
+
+(* ---------------------- GSS secure databases ---------------------- *)
+table droneDB(bitstring, bitstring, bitstring, bitstring). (* IDDj, PIDDj, Cj, Rj *)
+table userDB(bitstring, bitstring).                        (* PIDi, Xi *)
+
+   See "Timestamps" in the MODELLING NOTES at the top of this file.
+   The tags are plain public constants so that a clock broadcast is
+   never confused with any other message shape on the public channel. *)
+free tagClkGSS: bitstring.    (* marks GSS's   current-time broadcast (nowG) *)
+free tagClkDrone: bitstring.  (* marks Drone's current-time broadcast (nowD) *)
+
+(* ---------------------- Events ---------------------- *)
+event UserStart(bitstring, bitstring).      (* PIDi, N1 *)
+event GSSAuthUser(bitstring, bitstring).    (* PIDi, N1 *)
+event GSSStartDrone(bitstring, bitstring).  (* IDDj, N2 *)
+event DroneAuthGSS(bitstring, bitstring).   (* IDDj, N2 *)
+event DroneFinish(bitstring, bitstring).    (* IDDj, SK *)
+event GSSAuthDrone(bitstring, bitstring).   (* IDDj, SK *)
+event UserAuthGSS(bitstring, bitstring).    (* PIDi, SK *)
+event UserFinish(bitstring, bitstring).     (* PIDi, SK *)
+event DroneCaptured(bitstring).             (* physical capture of Dj *)
+event MDCorrupted(bitstring).               (* loss/theft of MUi's mobile device *)
+
+
+(* 1) Anonymity: the real identities must never become derivable by the
+      attacker (Section 5.1.8). IDi never leaves the user except over
+      the secure registration channel; IDDj travels only inside
+      M1 = (PIDi || IDDj) XOR h(K1 || TIDi || T1), masked with the
+      ML-KEM shared secret.
+      Both compromise processes are active in this model: CorruptMD
+      leaks {Ci, D1, D2} and CaptureDrone leaks {Fj, Gj} -- exactly the
+      stored values named in Sections 4.3 and 5.1.5. Neither set
+      contains an identity in the clear, so both queries are expected to
+      hold even under device compromise. *)
+query attacker(IDi).
+query attacker(IDDj).
+
+(* 2) Session key secrecy
+      (classic "secrecy test via symmetric wrapper" idiom: the private
+      marker SK is published encrypted under the session key actually
+      computed by the Drone and by the User; the marker is derivable iff
+      the attacker can obtain one of those keys). *)
+query attacker(SK).
+
+(* 3) Password secrecy: CorruptMD leaks {Ci, D1, D2} from a lost/stolen
+      mobile device. D1 = Bi XOR h(IDi || PWi || RPWi) and
+      Ci = h(IDi || RPWi || Xi) involve PWi only under h(.), so PWi
+      must not be derivable from them.
+      Scope of this query: it is symbolic derivability. It does not
+      model offline dictionary guessing of a low-entropy password;
+      that would be a separate "weaksecret PWi." query. *)
+query attacker(PWi).
+
+(* 4) Mutual authentication -- Drone <-> GSS (Section 5.1.7)
+      inj-event (injective correspondence) additionally rules out an
+      attacker making ONE real partner run "count" for MULTIPLE apparent
+      completions via message replay: every belief must be matched by a
+      genuinely distinct partner execution.
+
+      GSSAuthDrone ==> DroneFinish: GSS's check of
+      V3 = h(PIDDj || IDDj || Rj || N2 || N3) is bound to N2, which GSS
+      itself freshly generated for that session, and to Rj, which only
+      the registered drone can regenerate with its PUF.
+
+      DroneAuthGSS ==> GSSStartDrone: the Drone's check of
+      V2 = h(IDDj || N2 || Rj || T2) is bound to Rj (known only to GSS
+      and that drone) and to the timestamp T2, which must equal the
+      Drone's own current time nowD. Two Drone instances never share the
+      same nowD, so a Msg2 accepted by one instance cannot be replayed
+      to another. *)
+query x:bitstring, y:bitstring; inj-event(GSSAuthDrone(x,y)) ==> inj-event(DroneFinish(x,y)).
+query x:bitstring, y:bitstring; inj-event(DroneAuthGSS(x,y)) ==> inj-event(GSSStartDrone(x,y)).
+
+(* 5) Mutual authentication -- User <-> GSS (Section 5.1.7)
+      GSSAuthUser ==> UserStart: GSS's check of
+      V1 = h(PIDi || TIDi || Xi || K1 || N1 || T1) is bound to Xi and K1
+      (known only to MUi and GSS) and to the timestamp T1, which must
+      equal GSS's own current time nowG. Two GSS instances never share
+      the same nowG, so a Msg1 accepted by one instance cannot be
+      replayed to another.
+
+      UserFinish ==> UserAuthGSS: in the code, event UserAuthGSS(...)
+      fires after V5 is verified and BEFORE the final V4 check, and
+      event UserFinish(...) only fires AFTER the V4 check succeeds. So
+      the meaningful direction is "completion implies the earlier belief
+      was formed", i.e. Finish ==> AuthGSS -- not the reverse. (The
+      reverse cannot hold: an active attacker can replace V4 in Msg4
+      without invalidating V5, because V5 = h(N1 || N2 || K1 || PIDi ||
+      T4) does not cover V4 or SK; UserAuthGSS then fires while
+      UserFinish never does. The session is simply aborted at the V4
+      check, so this is a denial of service on the drone leg, not a
+      false acceptance.) *)
+query x:bitstring, y:bitstring; inj-event(GSSAuthUser(x,y))  ==> inj-event(UserStart(x,y)).
+query x:bitstring, y:bitstring; inj-event(UserFinish(x,y))   ==> inj-event(UserAuthGSS(x,y)).
+
+(* 6) Mutual authentication -- Drone <-> User, and key agreement
+      UserFinish(PIDi, SK) fires only after the User verifies
+      V4 = h(IDDj || PIDi || SK), a token that only the genuine Drone
+      produces (it is released only after the Drone has verified V2,
+      which requires Rj). This query checks that whenever a User
+      completes with session key y, some Drone (identity z) really
+      finished with that same y. Together with query 4
+      (GSSAuthDrone ==> DroneFinish) and query 5 (UserFinish ==>
+      UserAuthGSS), this closes the loop: User, GSS and Drone agree on
+      the same SK = h(PIDi || IDDj || N1 || N2 || N3).
+
+      Injective: each distinct User completion must map to a distinct
+      Drone completion with the same key. *)
+query x:bitstring, y:bitstring, z:bitstring; inj-event(UserFinish(x,y)) ==> inj-event(DroneFinish(z,y)).
+
+(* =====================================================================
+   Processes
+
+   IMPORTANT: ProVerif reads "let processName = ..." definitions
+   top-to-bottom and does NOT support forward references. Every
+   sub-process must be defined BEFORE the process that calls it.
+   The definitions below are therefore ordered by dependency:
+     GSSDroneReg                         -->  (used only by main process)
+     CaptureDrone, PUFOracle, DroneAKA   -->  DroneRegInit
+     GSSUserReg                          -->  (used only by main process)
+     CorruptMD, UserAKA                  -->  UserRegInit
+     GSSAKA                              -->  (used only by main process)
+   ===================================================================== *)
+
+(* GSS side, Step 2 *)
+let GSSDroneReg(skGSS: bitstring) =
+    in(scDG, (IDDj2: bitstring, rj2: bitstring, (Cj2: bitstring, Rj2: bitstring)));
+    (* Checks IDDj* ?= IDDj (the identity GSS assigned in Initialization, Step 3) *)
+    if IDDj2 = IDDj then
+    let PIDDj = h(cat2(IDDj2, skGSS)) in
+    let Gj = xor(PIDDj, h(cat2(IDDj2, rj2))) in
+    (* Store {PIDDj, (Cj, Rj)} indexed by IDDj *)
+    insert droneDB(IDDj2, PIDDj, Cj2, Rj2);
+    out(scGD, Gj).
+
+(* Physical capture of the drone (Section 3.1, Section 5.1.5): leaks
+   exactly what is stored in the drone's memory, {Fj, Gj}. The PUF
+   response Rj is NOT leaked because it is never stored; rj and Cj are
+   stored only masked inside Fj; DKj is protected against extraction
+   (assumption (ii) of Section 5.1.5). *)
+let CaptureDrone(Fj: bitstring, Gj: bitstring) =
+    event DroneCaptured(IDDj);
+    out(pub, (Fj, Gj)).
+
+(* "After capture, A can evaluate PUF(.) only through the captured
+   device itself" (Section 5.1.5; the PUF() query of Section 5.2):
+   the adversary may submit any challenge it knows and reads back the
+   response. Reproducing Rj would require the registered challenge Cj,
+   which stays masked by DKj inside Fj and by Rj inside M3.
+   (puf(.) is one global function here, so this oracle answers for the
+   PUF of every drone instance -- an over-approximation in the
+   adversary's favour.) *)
+let PUFOracle =
+    in(pub, c: bitstring);
+    out(pub, puf(c)).
+
+(* Drone side of the AKA phase (Section 4.4, Step 3) *)
+let DroneAKA(Fj: bitstring, Gj: bitstring) =
+    (* Clock abstraction: nowD is the Drone's current time (public). *)
+    new nowD: bitstring;
+    out(pub, (tagClkDrone, nowD));
+    (* Msg2 = {M3, V2, T2} *)
+    in(pub, (M3_in: bitstring, V2_in: bitstring, T2_in: bitstring));
+    (* Check |T3 - T2| <= DeltaT *)
+    if T2_in = nowD then
+    new T3: bitstring;
+    (* (rj || Cj) = Fj XOR h(IDDj || DKj) *)
+    let cat2(rj_d, Cj_d) = xor(Fj, h(cat2(IDDj, DKj))) in
+    (* PIDDj = Gj XOR h(IDDj || rj) *)
+    let PIDDj_d = xor(Gj, h(cat2(IDDj, rj_d))) in
+    (* Rj = PUF(Cj) *)
+    let Rj_d = puf(Cj_d) in
+    (* (PIDi || N1 || N2 || Cj) = M3 XOR h(IDDj || PIDDj || Rj || T2) *)
+    let cat2(PIDi_d, cat2(N1_d, cat2(N2_d, Cj_m))) =
+        xor(M3_in, h(cat2(IDDj, cat2(PIDDj_d, cat2(Rj_d, T2_in))))) in
+    (* V2* = h(IDDj || N2 || Rj || T2);  verify V2* ?= V2 *)
+    let V2c = h(cat2(IDDj, cat2(N2_d, cat2(Rj_d, T2_in)))) in
+    if V2c = V2_in then
+    event DroneAuthGSS(IDDj, N2_d);
+    new N3: bitstring;
+    let M4 = xor(N3, h(cat2(Rj_d, cat2(PIDDj_d, T3)))) in
+    let SK_d = h(cat2(PIDi_d, cat2(IDDj, cat2(N1_d, cat2(N2_d, N3))))) in
+    let V3 = h(cat2(PIDDj_d, cat2(IDDj, cat2(Rj_d, cat2(N2_d, N3))))) in
+    let V4 = h(cat2(IDDj, cat2(PIDi_d, SK_d))) in
+    event DroneFinish(IDDj, SK_d);
+    (* Msg3 = {M4, V3, V4, T3} *)
+    out(pub, (M4, V3, V4, T3));
+    out(pub, senc(SK, SK_d)).
+
+(* Drone side, Steps 1 and 3 *)
+let DroneRegInit =
+    new rj: bitstring;
+    new Cj: bitstring;
+    let Rj = puf(Cj) in
+    (* {IDDj, rj, (Cj, Rj)} via secure channel *)
+    out(scDG, (IDDj, rj, (Cj, Rj)));
+    in(scGD, Gj: bitstring);
+    let Fj = xor(cat2(rj, Cj), h(cat2(IDDj, DKj))) in
+    (* Stores {Fj, Gj}. From here on the drone runs AKA sessions; it may
+       also be physically captured, which leaks {Fj, Gj} and gives the
+       adversary oracle access to the device's PUF. *)
+    ( !DroneAKA(Fj, Gj) ) | ( !CaptureDrone(Fj, Gj) ) | ( !PUFOracle ).
+    (*
+       To analyse the network-only adversary (no physical capture),
+       replace the line above by
+           ( !DroneAKA(Fj, Gj) ).
+       If, beyond Section 5.1.5, the captured memory is also assumed to
+       reveal the drone's own identity (stored there per Initialization
+       Phase, Step 3), change CaptureDrone to output (Fj, Gj, IDDj);
+       "query attacker(IDDj)" is then trivially false, for a reason
+       unrelated to the message design, while the other queries are
+       unaffected in what they test.
+    *)
+
+(* GSS side, Step 2 *)
+let GSSUserReg(skGSS: bitstring) =
+    in(scGU, (IDi2: bitstring, RPWi2: bitstring));
+    let PIDi = h(cat2(IDi2, cat2(skGSS, RPWi2))) in
+    let Xi   = h(cat2(PIDi, skGSS)) in
+    let Bi   = xor(Xi, RPWi2) in
+    let Ci   = h(cat2(IDi2, cat2(RPWi2, Xi))) in
+    (* Look up {IDDj} in DB; store {PIDi, Xi} *)
+    insert userDB(PIDi, Xi);
+    out(scGU, (PIDi, IDDj, Bi, Ci)).
+
+(* Loss/theft of the mobile device (Section 3.1): leaks exactly what the
+   paper says is stored in the MD: {Ci, D1, D2}. PWi and IDi are NOT
+   stored and therefore not leaked. *)
+let CorruptMD(Ci: bitstring, D1: bitstring, D2: bitstring) =
+    event MDCorrupted(IDi);
+    out(pub, (Ci, D1, D2)).
+
+(* User side, Steps 1 and 5 *)
+let UserAKA(pkGSS: bitstring, Ci: bitstring, D1: bitstring, D2: bitstring) =
+    (* pkGSS is the genuine system parameter published once during the
+       trusted Initialization Phase (Step 4) and known in advance to all
+       legitimate entities. It must NOT be re-fetched via in(pub, ...):
+       doing so would let an active attacker substitute its own key pair
+       for pkGSS and trivially recover (PIDi || IDDj) from M1. Passing
+       it as a parameter models that its authenticity, not just its
+       value, is trusted. *)
+    (* Step 1: MUi inputs IDi and PWi; local recovery and login check *)
+    let RPWi = h(cat2(PWi, IDi)) in
+    let Bi = xor(D1, h(cat2(IDi, cat2(PWi, RPWi)))) in
+    let Xi = xor(Bi, RPWi) in
+    let cat2(PIDi, IDDj_2) = xor(D2, h(cat2(RPWi, IDi))) in
+    let Cicheck = h(cat2(IDi, cat2(RPWi, Xi))) in
+    if Cicheck = Ci then
+    (* Clock abstraction: T1 is the current time, read from the public
+       clock (see MODELLING NOTES). *)
+    in(pub, (=tagClkGSS, T1: bitstring));
+    new N1: bitstring;
+    new TIDi: bitstring;
+    (* (ct1, K1) <- Encaps(pkGSS) *)
+    new r1: bitstring;
+    let ct1 = kemCt(pkGSS, r1) in
+    let K1  = kemKey(pkGSS, r1) in
+    let M1 = xor(cat2(PIDi, IDDj_2), h(cat2(K1, cat2(TIDi, T1)))) in
+    let M2 = xor(N1, h(cat2(K1, cat2(Xi, T1)))) in
+    let V1 = h(cat2(PIDi, cat2(TIDi, cat2(Xi, cat2(K1, cat2(N1, T1)))))) in
+    event UserStart(PIDi, N1);
+    (* Msg1 = {ct1, M1, M2, V1, TIDi, T1} *)
+    out(pub, (ct1, M1, M2, V1, TIDi, T1));
+    (* Step 5: Msg4 = {M5, V4, V5, T3, T4} *)
+    in(pub, (M5_in: bitstring, V4_in: bitstring, V5_in: bitstring, T3_in: bitstring, T4_in: bitstring));
+    (* (N2 || N3) = M5 XOR h(N1 || K1 || PIDi || Xi) *)
+    let cat2(N2_u, N3_u) = xor(M5_in, h(cat2(N1, cat2(K1, cat2(PIDi, Xi))))) in
+    (* Verify V5 ?= h(N1 || N2 || K1 || PIDi || T4) *)
+    let V5c = h(cat2(N1, cat2(N2_u, cat2(K1, cat2(PIDi, T4_in))))) in
+    if V5c = V5_in then
+    let SK_u = h(cat2(PIDi, cat2(IDDj_2, cat2(N1, cat2(N2_u, N3_u))))) in
+    (* Verify V4 ?= h(IDDj || PIDi || SK) *)
+    let V4c  = h(cat2(IDDj_2, cat2(PIDi, SK_u))) in
+    event UserAuthGSS(PIDi, SK_u);
+    if V4c = V4_in then
+    event UserFinish(PIDi, SK_u);
+    out(pub, senc(SK, SK_u)).
+
+let UserRegInit(pkGSS: bitstring) =
+    let RPWi = h(cat2(PWi, IDi)) in
+    (* {IDi, RPWi} via secure channel *)
+    out(scGU, (IDi, RPWi));
+    in(scGU, (PIDi_r: bitstring, IDDj_r: bitstring, Bi: bitstring, Ci: bitstring));
+    let D1 = xor(Bi, h(cat2(IDi, cat2(PWi, RPWi)))) in
+    let D2 = xor(cat2(PIDi_r, IDDj_r), h(cat2(RPWi, IDi))) in
+    (* Stores {Ci, D1, D2} in MD *)
+    ( !UserAKA(pkGSS, Ci, D1, D2) ) | ( !CorruptMD(Ci, D1, D2) ).
+
+let GSSAKA(skGSS: bitstring) =
+    (* Clock abstraction: nowG is GSS's current time (public). *)
+    new nowG: bitstring;
+    out(pub, (tagClkGSS, nowG));
+    (* Msg1 = {ct1, M1, M2, V1, TIDi, T1} *)
+    in(pub, (ct1_r: bitstring, M1_r: bitstring, M2_r: bitstring, V1_r: bitstring,
+             TIDi_r: bitstring, T1_r: bitstring));
+    (* Check |T2 - T1| <= DeltaT *)
+    if T1_r = nowG then
+    (* K1 <- Decaps(skGSS, ct1) *)
+    let K1_r = kemDecaps(skGSS, ct1_r) in
+    (* (PIDi || IDDj) = M1 XOR h(K1 || TIDi || T1) *)
+    let cat2(PIDi_r, IDDj_r) = xor(M1_r, h(cat2(K1_r, cat2(TIDi_r, T1_r)))) in
+    (* retrieve Xi corresponding to PIDi *)
+    get userDB(=PIDi_r, Xi_r) in
+    (* N1 = M2 XOR h(K1 || Xi || T1) *)
+    let N1_r = xor(M2_r, h(cat2(K1_r, cat2(Xi_r, T1_r)))) in
+    (* V1* = h(PIDi || TIDi || Xi || K1 || N1 || T1);  verify V1* ?= V1 *)
+    let V1c = h(cat2(PIDi_r, cat2(TIDi_r, cat2(Xi_r, cat2(K1_r, cat2(N1_r, T1_r)))))) in
+    if V1c = V1_r then
+    event GSSAuthUser(PIDi_r, N1_r);
+    (* Look up <PIDDj, Cj, Rj> <- IDDj;  verify PIDDj* ?= h(IDDj || skGSS) *)
+    get droneDB(=IDDj_r, PIDDj_r, Cj_r, Rj_r) in
+    let PIDDjCheck = h(cat2(IDDj_r, skGSS)) in
+    if PIDDjCheck = PIDDj_r then
+    (* Clock abstraction: T2 is the current time at which Msg2 is sent,
+       read from the public clock (see MODELLING NOTES). *)
+    in(pub, (=tagClkDrone, T2: bitstring));
+    new N2: bitstring;
+    event GSSStartDrone(IDDj_r, N2);
+    let M3 = xor(cat2(PIDi_r, cat2(N1_r, cat2(N2, Cj_r))),
+                 h(cat2(IDDj_r, cat2(PIDDj_r, cat2(Rj_r, T2))))) in
+    let V2 = h(cat2(IDDj_r, cat2(N2, cat2(Rj_r, T2)))) in
+    (* Msg2 = {M3, V2, T2} *)
+    out(pub, (M3, V2, T2));
+    (* Step 4: Msg3 = {M4, V3, V4, T3} *)
+    in(pub, (M4_r: bitstring, V3_r: bitstring, V4_r: bitstring, T3_r: bitstring));
+    new T4: bitstring;
+    (* N3 = M4 XOR h(Rj || PIDDj || T3) *)
+    let N3_r = xor(M4_r, h(cat2(Rj_r, cat2(PIDDj_r, T3_r)))) in
+    (* Verify V3 ?= h(PIDDj || IDDj || Rj || N2 || N3) *)
+    let V3c = h(cat2(PIDDj_r, cat2(IDDj_r, cat2(Rj_r, cat2(N2, N3_r))))) in
+    if V3c = V3_r then
+    (* GSS does not use SK itself; SK_g only names the session in the
+       GSSAuthDrone event so that it can be matched with DroneFinish. *)
+    let SK_g = h(cat2(PIDi_r, cat2(IDDj_r, cat2(N1_r, cat2(N2, N3_r))))) in
+    event GSSAuthDrone(IDDj_r, SK_g);
+    let M5 = xor(cat2(N2, N3_r), h(cat2(N1_r, cat2(K1_r, cat2(PIDi_r, Xi_r))))) in
+    let V5 = h(cat2(N1_r, cat2(N2, cat2(K1_r, cat2(PIDi_r, T4))))) in
+    (* Msg4 = {M5, V4, V5, T3, T4} *)
+    out(pub, (M5, V4_r, V5, T3_r, T4)).
+
+process
+    new skGSS: bitstring;
+    let pkGSS = pk(skGSS) in
+    out(pub, pkGSS);
+    (
+        (!DroneRegInit)               |
+        (!GSSDroneReg(skGSS))         |
+        (!UserRegInit(pkGSS))         |
+        (!GSSUserReg(skGSS))          |
+        (!GSSAKA(skGSS))
+    )
