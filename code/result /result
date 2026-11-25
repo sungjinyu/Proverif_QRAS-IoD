@@ -1,0 +1,22 @@
+--------------------------------------------------------------
+Verification summary:
+
+Query not attacker(IDi[]) is true.
+
+Query not attacker(IDDj[]) is true.
+
+Query not attacker(SK[]) is true.
+
+Query not attacker(PWi[]) is true.
+
+Query inj-event(GSSAuthDrone(x,y)) ==> inj-event(DroneFinish(x,y)) is true.
+
+Query inj-event(DroneAuthGSS(x,y)) ==> inj-event(GSSStartDrone(x,y)) is true.
+
+Query inj-event(GSSAuthUser(x,y)) ==> inj-event(UserStart(x,y)) is true.
+
+Query inj-event(UserFinish(x,y)) ==> inj-event(UserAuthGSS(x,y)) is true.
+
+Query inj-event(UserFinish(x,y)) ==> inj-event(DroneFinish(z,y)) is true.
+
+--------------------------------------------------------------
